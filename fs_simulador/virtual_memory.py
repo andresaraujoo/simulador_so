@@ -45,6 +45,7 @@ class VirtualMemory:
                 "timestamp_ms": time.time() - 0.045,  # Simula página antiga (45ms)
                 "ref_bit": 0,
                 "used_bytes": self.page_size,
+                "content": bytes(self.page_size),
             }
             page_table[p] = entry
             self.frames[frame_id] = entry
@@ -99,6 +100,7 @@ class VirtualMemory:
                 "timestamp_ms": 0.0,
                 "ref_bit": 0,
                 "used_bytes": used,
+                "content": None,  # bytes na RAM apenas quando a pagina esta presente
             }
             print(f"Página Lógica {page_num} : {used} Bytes ocupados ({pct:.0f}%)")
 
@@ -200,9 +202,14 @@ class VirtualMemory:
         else:
             target_frame = self._evict_page(swap_callback)
 
-        # Carrega página solicitada do Swap/Disco para a RAM
-        if swap_callback:
-            swap_callback("SWAP_IN", process_name, page_num)
+        # Carrega realmente os bytes da pagina armazenados no disco virtual.
+        restored = swap_callback("SWAP_IN", process_name, page_num) if swap_callback else None
+        if restored is not None:
+            if not isinstance(restored, bytes) or len(restored) != self.page_size:
+                raise ValueError("Conteudo do swap deve ser uma pagina completa em bytes.")
+            entry["content"] = restored
+        elif entry["content"] is None:
+            entry["content"] = bytes(self.page_size)
 
         self.swap_area = [
             s for s in self.swap_area
@@ -261,8 +268,15 @@ class VirtualMemory:
             )
 
         victim_frame = victim_entry["frame"]
+        # Persistir os bytes antes de marcar a moldura como liberada.
+        if swap_callback:
+            swap_callback(
+                "SWAP_OUT", victim_entry["process"], victim_entry["page"],
+                victim_entry["content"],
+            )
         victim_entry["present"] = False
         victim_entry["frame"] = None
+        victim_entry["content"] = None
         self.frames[victim_frame] = None
 
         self.swap_area.append({
@@ -270,9 +284,6 @@ class VirtualMemory:
             "pid": victim_entry["pid"],
             "page": victim_entry["page"],
         })
-
-        if swap_callback:
-            swap_callback("SWAP_OUT", victim_entry["process"], victim_entry["page"])
 
         print(
             f"- Removendo Página Lógica {victim_entry['page']} do PID {victim_entry['pid']} "

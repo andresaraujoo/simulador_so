@@ -15,15 +15,20 @@ class MemoryManager:
         self.virtual = VirtualMemory(page_size=4096, frame_pool=[12, 45, 73, 88])
         self.next_pid = 103
         self.process_registry = {}  # name -> {"pid": int, "type": "critical"|"normal"}
+        # Cada pagina usa um bloco de disco exclusivo: sem hash ou colisao.
+        self.swap_blocks = {}  # (nome_processo, pagina) -> bloco fisico
 
     def create_process(self, name, size_bytes, proc_type="normal"):
+        if type(size_bytes) is not int or size_bytes <= 0:
+            raise ValueError("O tamanho do processo deve ser um inteiro positivo em bytes.")
         proc_type = proc_type.lower()
         if name in self.process_registry:
             raise ValueError(f"Já existe um processo chamado '{name}'.")
 
         pid = self.next_pid
         if proc_type == "critical":
-            size_kb = max(1, size_bytes // 1024)
+            # Arredonda para CIMA: 1025 bytes necessitam de 2 KB.
+            size_kb = (size_bytes + 1023) // 1024
             self.reserved.allocate(name, size_kb)
             self.process_registry[name] = {"pid": pid, "type": "critical"}
         elif proc_type == "normal":
@@ -43,15 +48,48 @@ class MemoryManager:
             self.reserved.deallocate(name)
         else:
             self.virtual.terminate_process(name)
+            # Libera os blocos de swap pertencentes ao processo finalizado.
+            if self.filesystem:
+                slots = [key for key in self.swap_blocks if key[0] == name]
+                self.filesystem.disk.release([self.swap_blocks[key] for key in slots])
+                for key in slots:
+                    del self.swap_blocks[key]
 
-    def _handle_swap_io(self, direction, process_name, page_num):
-        """Integra operações de Swap com o Disco e Escalonador das Etapas 1 e 2."""
+    def _handle_swap_io(self, direction, process_name, page_num, content=None):
+        """Aloca um bloco fisico exclusivo, persiste bytes e registra a E/S."""
         if not self.filesystem:
-            return
-        total_blocks = self.filesystem.disk.total_blocks
-        swap_block = (hash(f"{process_name}:{page_num}") % (total_blocks - 1)) + 1
-        print(f"[SWAP -> DISCO] Acionando E/S ({direction}) no bloco físico {swap_block} da memória secundária...")
-        self.filesystem.perform_io(direction, [swap_block])
+            return None
+        disk = self.filesystem.disk
+        if self.virtual.page_size != disk.block_size:
+            raise ValueError("Nesta simulacao, pagina e bloco de swap devem ter o mesmo tamanho.")
+
+        key = (process_name, page_num)
+        if key not in self.swap_blocks:
+            # Reserva bloco do disco; nao reutiliza blocos de arquivos normais.
+            block_index = disk.allocate(1, self.filesystem.root, "SWAP")[0]
+            self.swap_blocks[key] = block_index
+            disk.blocks[block_index].update({
+                "process": process_name,
+                "page": page_num,
+                "content": bytes(self.virtual.page_size),
+            })
+
+        block_index = self.swap_blocks[key]
+        block = disk.blocks[block_index]
+        if direction == "SWAP_OUT":
+            if not isinstance(content, bytes) or len(content) != self.virtual.page_size:
+                raise ValueError("SWAP_OUT exige o conteudo completo de uma pagina em bytes.")
+            block["content"] = content
+        elif direction != "SWAP_IN":
+            raise ValueError("Operacao de swap desconhecida.")
+
+        print(
+            f"[SWAP -> DISCO] {direction}: pagina {page_num} de '{process_name}', "
+            f"bloco {block_index}, {len(block['content'])} bytes."
+        )
+        self.filesystem.perform_io(direction, [block_index])
+        # SWAP_IN devolve os bytes efetivamente gravados no bloco de disco.
+        return block["content"] if direction == "SWAP_IN" else None
 
     def translate_address(self, process_name, page_num):
         return self.virtual.translate_address(process_name, page_num)

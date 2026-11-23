@@ -55,6 +55,14 @@ class Disk:
                 print(f"Bloco {index:02d}: [LIVRE]")
                 continue
 
+            if block["type"] == "SWAP":
+                print(
+                    f"Bloco {index:02d}: [SWAP] "
+                    f"{block['process']}:pagina {block['page']} "
+                    f"({len(block['content'])} bytes)"
+                )
+                continue
+
             node = block["node"]
             path = get_path(node)
 
